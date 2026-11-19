@@ -193,6 +193,9 @@ function metric(label, value, icon, note = "", color = "") {
 function serviceLogo(s) {
   return `<span class="service-logo ${s.color || ""}">${iconFor[s.name] || s.name[0]}</span>`;
 }
+function claimLabel(key) {
+  return app.data.attributes?.[key] || ({ is_enrolled: "Currently enrolled", service_subject_id: "Private service reference", role: "Campus role", class_membership: "Eligible class membership", course_membership: "Course list" }[key] || key);
+}
 function serviceRows() {
   return app.services
     .map(
@@ -243,13 +246,14 @@ function myId() {
   return `${pageHead("YOUR VERIFIED IDENTITY", "Your campus ID", "Show this verified pass when a campus service needs to confirm your identity.", `<button class="secondary-button" id="refresh-pass">↻ &nbsp;Refresh pass</button>`)}<div class="digital-layout"><section>${idCard(true)}<div class="trust-strip"><span class="trust-shield">◈</span><div><strong>Built so a screenshot has a short shelf life</strong><br><span>Your pass is signed, expires after 30 seconds, and works only once.</span></div></div></section><aside class="action-stack"><div class="panel info-panel"><h3>Live verification pass</h3><p>This rotating token is used by approved services to verify your campus ID. It contains no personal details.</p><div class="pass-code" id="pass-code">${app.pass ? esc(app.pass.token) : "Preparing your secure pass…"}</div><div class="countdown-bar"><span id="countdown-bar"></span></div><div class="hint-row"><span>Refreshes automatically</span><span id="pass-seconds">30 seconds</span></div></div><div class="panel info-panel"><h3>Try a campus service</h3><p>Choose an approved service to verify this pass. Each pass works once.</p><label for="verify-service">Verify with</label><select id="verify-service">${app.services.map((s) => `<option value="${s.id}" ${!s.granted ? "disabled" : ""}>${esc(s.name)}${s.granted ? "" : " — approval needed"}</option>`).join("")}</select><button class="primary-button" id="verify-pass" style="width:100%;height:37px;font-size:10px">Verify my identity &nbsp;→</button></div><div class="panel info-panel"><h3>Identity details</h3><p>Your profile is verified by Northfield University.</p><div class="hint-row"><span>Role</span><b>${esc(app.user.role)}</b></div><div class="hint-row" style="margin-top:10px"><span>Program</span><b>${esc(app.user.program)}</b></div></div></aside></div>`;
 }
 function serviceCard(s) {
+  const eligible = !s.roles || s.roles.includes(app.user.role);
   const attrs = s.attributes
     .map(
       (a) =>
-        `<span class="attribute-tag">${esc(app.data.attributes?.[a] || { is_enrolled: "Currently enrolled", full_name: "Full name", roll_number: "Enrollment number", hostel_resident: "Hostel resident status", program: "Program of study" }[a] || a)}</span>`,
+        `<span class="attribute-tag">${esc(claimLabel(a))}</span>`,
     )
     .join("");
-  return `<article class="panel campus-service-card"><div class="campus-service-top">${serviceLogo(s)}<div><h3>${esc(s.name)}</h3><small>${esc(s.kind)}</small></div><button class="toggle ${s.granted ? "on" : ""}" role="switch" aria-checked="${s.granted}" aria-label="${s.granted ? "Revoke" : "Approve"} ${esc(s.name)} access" data-consent="${s.id}"></button></div><p class="service-description">${esc(s.description)}</p><div class="requested-label">Only asks for</div><div class="attribute-tags">${attrs}</div><div class="purpose-text">Purpose: ${esc(s.purpose)}</div><div class="service-card-footer"><span class="service-state ${s.granted ? "" : "off"}"><i class="state-dot"></i>${s.granted ? "You approved access" : "No access granted"}</span><button class="inline-link" data-verify="${s.id}">Try verification →</button></div></article>`;
+  return `<article class="panel campus-service-card"><div class="campus-service-top">${serviceLogo(s)}<div><h3>${esc(s.name)}</h3><small>${esc(s.kind)}</small></div><button class="toggle ${s.granted ? "on" : ""}" role="switch" aria-checked="${s.granted}" aria-label="${s.granted ? "Revoke" : "Approve"} ${esc(s.name)} access" data-consent="${s.id}" ${eligible ? "" : "disabled"}></button></div><p class="service-description">${esc(s.description)}</p><div class="requested-label">Only asks for</div><div class="attribute-tags">${attrs}</div><div class="purpose-text">Purpose: ${esc(s.purpose)}</div><div class="service-card-footer"><span class="service-state ${s.granted ? "" : "off"}"><i class="state-dot"></i>${!eligible ? "Not available for your role" : s.granted ? "You approved access" : "No access granted"}</span><button class="inline-link" data-verify="${s.id}" ${eligible ? "" : "disabled"}>${eligible ? "Try verification →" : "Not available"}</button></div></article>`;
 }
 function servicesView() {
   return `${pageHead("ACCESS ON YOUR TERMS", "Campus services", "Choose what each campus service can verify. You can change your mind at any time.")}<div class="panel" style="padding:15px;margin-bottom:14px;background:#f3f6ff;border-color:#e7ecff"><div style="display:flex;gap:10px;align-items:center"><span class="trust-shield">♧</span><div><b style="font-size:10px">Small details. A big difference.</b><div style="font-size:9px;color:#78859d;margin-top:4px">Library sees only that you’re enrolled. Your enrollment number stays private there.</div></div></div></div><div class="service-card-grid">${app.services.map(serviceCard).join("")}</div>`;
@@ -274,7 +278,7 @@ async function sessionsView() {
     toast(e.message);
   }
   const sessions = data.sessions;
-  return `${pageHead("ACCOUNT SECURITY", "Devices & sessions", "See where your campus identity is active. Sign out any device instantly.")}<div class="page-columns"><section class="panel"><div class="panel-header"><div><h2>Active devices</h2><p>${sessions.length} active ${sessions.length === 1 ? "session" : "sessions"} for this account</p></div><span class="hash-status">◈ &nbsp;Protected</span></div>${sessions.map((s, i) => `<div class="device-item"><span class="device-icon">${i ? "▤" : "⌘"}</span><div class="device-copy"><b>${i ? "Web browser" : "This device"}${i ? "" : ` · ${esc(s.device.slice(0, 65))}`}</b><small>Signed in ${fmt(s.created_at)} · Last active ${fmt(s.last_seen)}</small></div>${i === 0 ? '<span class="current-device">This device</span>' : `<button class="danger-button" data-revoke-session="${s.id}">Sign out</button>`}</div>`).join("") || '<div class="empty-state">No active devices.</div>'}<div style="padding:13px"><button class="secondary-button" id="signout-other">Sign out all other devices</button></div></section><aside class="panel info-panel"><h3>Session protection</h3><p>Your sessions expire after 12 hours. Sign out a device if it’s lost or you don’t recognize it.</p><div class="trust-strip" style="margin-top:10px"><span class="trust-shield">◈</span><div><strong>Multi-factor sign in</strong><br><span>Password + authenticator code</span></div></div><button class="text-button" id="recover-link-side">Start device recovery</button></aside></div>`;
+  return `${pageHead("ACCOUNT SECURITY", "Devices & sessions", "See where your campus identity is active. Sign out any device instantly.")}<div class="page-columns"><section class="panel"><div class="panel-header"><div><h2>Active devices</h2><p>${sessions.length} active ${sessions.length === 1 ? "session" : "sessions"} for this account</p></div><span class="hash-status">◈ &nbsp;Protected</span></div>${sessions.map((s, i) => `<div class="device-item"><span class="device-icon">${i ? "▤" : "⌘"}</span><div class="device-copy"><b>${i ? "Web browser" : "This device"}${i ? "" : ` · ${esc(s.device.slice(0, 65))}`}</b><small>Signed in ${fmt(s.created_at)} · Last active ${fmt(s.last_seen)}</small></div>${i === 0 ? '<span class="current-device">This device</span>' : `<button class="danger-button" data-revoke-session="${s.id}">Sign out</button>`}</div>`).join("") || '<div class="empty-state">No active devices.</div>'}<div style="padding:13px"><button class="secondary-button" id="signout-other">Sign out all other devices</button></div></section><aside class="panel info-panel"><h3>Session protection</h3><p>Your session ends after 30 minutes of inactivity, with a 12-hour maximum. You can also sign out any device here.</p><div class="trust-strip" style="margin-top:10px"><span class="trust-shield">◈</span><div><strong>Multi-factor sign in</strong><br><span>Password + authenticator code</span></div></div><button class="text-button" id="recover-link-side">Start device recovery</button></aside></div>`;
 }
 async function adminView() {
   let data;
@@ -344,6 +348,21 @@ async function reloadData() {
     return false;
   }
 }
+async function saveConsent(service, granted) {
+  try {
+    await api(`/api/consents/${service.id}`, {
+      method: "PUT",
+      body: JSON.stringify({ granted }),
+    });
+    service.granted = granted;
+    await reloadData();
+    render();
+    toast(`${service.name} access ${granted ? "approved" : "revoked"}.`);
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
 function bindContent() {
   const refresh = $("#refresh-pass");
   if (refresh) refresh.addEventListener("click", refreshPass);
@@ -353,21 +372,26 @@ function bindContent() {
       verifySelected($("#verify-service").value),
     );
   $$("[data-consent]").forEach((b) =>
-    b.addEventListener("click", async () => {
-      const s = app.services.find((s) => s.id === b.dataset.consent);
-      const granted = !s.granted;
-      try {
-        await api(`/api/consents/${s.id}`, {
-          method: "PUT",
-          body: JSON.stringify({ granted }),
-        });
-        s.granted = granted;
-        await reloadData();
-        render();
-        toast(`${s.name} access ${granted ? "approved" : "revoked"}.`);
-      } catch (e) {
-        toast(e.message);
+    b.addEventListener("click", () => {
+      const service = app.services.find((s) => s.id === b.dataset.consent);
+      const granted = !service.granted;
+      if (!granted) {
+        saveConsent(service, false);
+        return;
       }
+      const claims = service.attributes
+        .map((key) => `<span class="attribute-tag">${esc(claimLabel(key))}</span>`)
+        .join("");
+      showModal(
+        "Review data sharing",
+        `<p class="modal-sub"><b>${esc(service.name)}</b> requests these details for: ${esc(service.purpose)}.</p><div class="attribute-tags">${claims}</div><p class="modal-sub">You can revoke this permission at any time from Privacy & sharing.</p>`,
+        "Cancel",
+        '<button class="primary-small" id="approve-sharing">Approve sharing</button>',
+      );
+      $("#approve-sharing").addEventListener("click", () => {
+        closeModal();
+        saveConsent(service, true);
+      });
     }),
   );
   $$("[data-verify]").forEach((b) =>
@@ -462,7 +486,31 @@ function updatePassDisplay() {
   if (mark) mark.textContent = app.pass.token.slice(0, 4).toUpperCase();
 }
 async function verifySelected(serviceId) {
-  if (!serviceId) return;
+  const service = app.services.find((item) => item.id === serviceId);
+  if (!service) return;
+  if (!service.granted) {
+    showModal(
+      "Approval needed",
+      `<p class="modal-sub">Open Privacy & sharing to review and approve the details ${esc(service.name)} requests.</p>`,
+      "Close",
+    );
+    return;
+  }
+  const claims = service.attributes
+    .map((key) => `<span class="attribute-tag">${esc(claimLabel(key))}</span>`)
+    .join("");
+  showModal(
+    "Review this identity check",
+    `<p class="modal-sub"><b>${esc(service.name)}</b> will receive these details for: ${esc(service.purpose)}.</p><div class="attribute-tags">${claims}</div><p class="modal-sub">Your name and enrollment number are not sent unless listed above.</p>`,
+    "Cancel",
+    '<button class="primary-small" id="confirm-verification">Continue</button>',
+  );
+  $("#confirm-verification").addEventListener("click", () => {
+    closeModal();
+    completeVerification(serviceId);
+  });
+}
+async function completeVerification(serviceId) {
   try {
     if (!app.pass || app.pass.expires_at <= Date.now() / 1000)
       await refreshPass();
@@ -488,7 +536,7 @@ function showVerifyResult(result) {
   const attrs = Object.entries(result.attributes)
     .map(
       ([k, v]) =>
-        `<div class="result-attribute"><span>${esc({ is_enrolled: "Currently enrolled", full_name: "Full name", roll_number: "Enrollment number", program: "Program of study", hostel_resident: "Hostel resident status" }[k] || k)}</span><b>${esc(typeof v === "boolean" ? (v ? "Yes" : "No") : v)}</b></div>`,
+        `<div class="result-attribute"><span>${esc({ is_enrolled: "Currently enrolled", service_subject_id: "Private service reference", role: "Campus role", class_membership: "Eligible class membership", course_membership: "Course list" }[k] || k)}</span><b>${esc(typeof v === "boolean" ? (v ? "Yes" : "No") : v)}</b></div>`,
     )
     .join("");
   showModal(

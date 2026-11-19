@@ -4,13 +4,14 @@ A cross-platform, runnable prototype for the Secure Digital Identity for Campus 
 
 ## Run it
 
-Requirements: Python 3.10 or newer. No package installation is needed.
+Requirements: Python 3.10 or newer. The launcher installs the security dependencies on first run; the first launch needs an internet connection.
 
 On Windows, double-click `Start TrustPass.bat`. On macOS, run `chmod +x "Start TrustPass.command"` once in Terminal if the synced file isn't marked executable, then double-click it. Keep the server window open while using the app. Both launchers check for an existing TrustPass server before starting another one.
 
 From the project folder, run:
 
 ```powershell
+python -m pip install -r requirements.txt
 python backend/server.py
 ```
 
@@ -35,12 +36,13 @@ The sample student’s recovery backup code is `A7KP-94QX` (the recovery flow al
 
 ## What works
 
-- Password and TOTP sign-in, a 12-hour server-side session, sign-out, and progressive role-aware access.
+- Argon2id password hashing and TOTP sign-in, opaque session tokens that rotate during active use, a 12-hour maximum session with a 30-minute idle timeout, and sign-out controls for one or every device. Existing demo password hashes are upgraded after a successful sign-in.
 - A signed, 30-second identity pass. It is stored by hash, consumed once, and rejected after expiry or replay.
-- Per-service consent controls and attribute minimization for Library, Hostel, Exam Hall, and Campus Gate. A verifier receives only the fields registered by that service.
+- Per-service consent controls and attribute minimization for Library, Fee Portal, Attendance, and Learning (LMS). Library receives only an enrollment yes/no value; the fee portal receives a different pseudonymous reference; Attendance and LMS receive only their role or course claims.
+- Role eligibility is checked by the API during service verification. The interface also shows when a service is unavailable for the signed-in role.
 - Session listing and immediate individual session revocation.
 - Append-only activity records linked with SHA-256 hashes, with full-chain verification in the access-history screen.
-- Recovery using the demo account password, a one-time backup code, a short cooling-off period, and an email code. Completing recovery revokes all the account’s sessions.
+- Recovery using the demo account password, a one-time backup code, a short cooling-off period, and an email code. Recovery attempts are rate-limited, and completing recovery revokes all the account’s sessions.
 - Admin user list, role changes enforced by the backend, and identity suspension with session revocation.
 
 ## Database and prototype limits
@@ -49,7 +51,9 @@ This prototype uses SQLite locally so it starts immediately and keeps data betwe
 
 ## Database setup
 
-The Supabase project `pfixtpslguysgqebfeej` has the TrustPass schema applied. The initial identity schema is in `supabase/schema.sql`; the private app store used by this demo is in `supabase/app_store.sql`. The app store holds the demo accounts, sessions, service consents, passes, recovery records, backup-code hashes, sign-in lockouts, and audit trail. It lives in Supabase's `private` schema and is accessible only to the backend database connection. All 15 public and 8 private tables have row-level security enabled; browser roles cannot access the private tables.
+The Supabase project `pfixtpslguysgqebfeej` has the TrustPass schema applied. The initial identity schema is in `supabase/schema.sql`; the private app store used by this demo is in `supabase/app_store.sql`. The app store holds the demo accounts, sessions, service consents, passes, recovery records, backup-code hashes, sign-in and recovery lockouts, and audit trail. It lives in Supabase's `private` schema and is accessible only to the backend database connection. All 15 public and 8 private tables have row-level security enabled; browser roles cannot access the private tables.
+
+For an already-created Supabase app store, run `supabase/append_only_audit.sql` once in the Supabase SQL Editor. This adds a database trigger that rejects audit updates and deletes. New databases get the same trigger from `supabase/app_store.sql`.
 
 By default, Windows and Mac use the local SQLite file. To use Supabase locally, copy `.env.example` to `.env`, then set `DATABASE_URL` to the **Transaction pooler** connection string from Supabase Dashboard → **Connect** (port `6543`). Set a long random `TRUSTPASS_SIGNING_KEY` as well. Install the optional Supabase driver with `python -m pip install -r requirements.txt`. The backend switches to Supabase automatically when `DATABASE_URL` is present; it never sends the database password to the browser. Keep `.env` private and do not commit it.
 

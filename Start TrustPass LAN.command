@@ -14,6 +14,15 @@ if ! python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 10))'; then
   exit 1
 fi
 
+if ! python3 -c 'import argon2' >/dev/null 2>&1; then
+  echo "Installing TrustPass security dependencies (one-time setup)..."
+  if ! python3 -m pip install -r requirements.txt; then
+    echo "Dependency installation failed. Check your internet connection and try again."
+    read -r -p "Press Return to close this window..."
+    exit 1
+  fi
+fi
+
 APP_URL="http://127.0.0.1:8000"
 if lsof -nP -iTCP:8000 -sTCP:LISTEN >/dev/null 2>&1; then
   echo "Port 8000 is already in use. Stop the other TrustPass server first (press Ctrl+C in its Terminal window), then try again."

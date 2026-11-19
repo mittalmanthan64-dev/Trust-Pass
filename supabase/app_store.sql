@@ -57,6 +57,17 @@ create table if not exists private.audit (
   entry_hash text not null
 );
 
+create or replace function private.prevent_audit_mutation()
+returns trigger language plpgsql set search_path = '' as $$
+begin
+  raise exception 'audit records are append-only';
+end;
+$$;
+revoke all on function private.prevent_audit_mutation() from public, anon, authenticated;
+drop trigger if exists audit_append_only on private.audit;
+create trigger audit_append_only before update or delete on private.audit
+for each row execute function private.prevent_audit_mutation();
+
 create table if not exists private.recovery (
   id text primary key,
   user_id text not null references private.users(id),

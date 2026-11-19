@@ -21,6 +21,17 @@ if errorlevel 1 (
   exit /b 1
 )
 
+%PYTHON% -c "import argon2" >nul 2>&1
+if errorlevel 1 (
+  echo Installing TrustPass security dependencies (one-time setup)...
+  %PYTHON% -m pip install -r requirements.txt
+  if errorlevel 1 (
+    echo Dependency installation failed. Check your internet connection and try again.
+    pause
+    exit /b 1
+  )
+)
+
 powershell -NoProfile -Command "try { $r=Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 http://127.0.0.1:8000/api/bootstrap; if ($r.StatusCode -eq 200) { exit 0 } else { exit 1 } } catch { exit 1 }" >nul 2>&1
 if errorlevel 1 (
   start "TrustPass local server" /D "%~dp0" cmd /k %PYTHON% backend\server.py

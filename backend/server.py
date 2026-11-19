@@ -16,6 +16,12 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+try:
+    from argon2 import PasswordHasher
+
+    ARGON2 = PasswordHasher(time_cost=2, memory_cost=19456, parallelism=1)
+except ImportError:
+    ARGON2 = None
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -51,16 +57,19 @@ if os.environ.get("VERCEL") and not DATABASE_URL:
     raise RuntimeError("Set DATABASE_URL in the Vercel project environment before deploying.")
 if os.environ.get("VERCEL") and not os.environ.get("TRUSTPASS_SIGNING_KEY"):
     raise RuntimeError("Set TRUSTPASS_SIGNING_KEY in the Vercel project environment before deploying.")
+if os.environ.get("VERCEL") and ARGON2 is None:
+    raise RuntimeError("Install argon2-cffi from requirements.txt before deploying.")
 
 COOKIE_SECURE = "; Secure" if os.environ.get("VERCEL") else ""
+IDLE_TIMEOUT_SECONDS = 30 * 60
 
 SERVICES = [
-    {"id": "library", "name": "Library", "kind": "Books & study", "description": "Confirm active student status for borrowing privileges.", "attributes": ["is_enrolled"], "purpose": "Confirm eligibility to borrow books", "color": "mint"},
-    {"id": "hostel", "name": "Hostel", "kind": "Housing", "description": "Check resident status for building access.", "attributes": ["full_name", "hostel_resident"], "purpose": "Confirm resident access at the building", "color": "violet"},
-    {"id": "exams", "name": "Exam Hall", "kind": "Examinations", "description": "Verify exam registration with your roll number.", "attributes": ["full_name", "roll_number", "is_enrolled"], "purpose": "Match your exam registration", "color": "amber"},
-    {"id": "gate", "name": "Campus Gate", "kind": "Campus access", "description": "Check campus entry eligibility.", "attributes": ["is_enrolled"], "purpose": "Verify current campus access", "color": "blue"},
+    {"id": "library", "name": "Library", "kind": "Books & study", "description": "Confirm active student status for borrowing privileges.", "attributes": ["is_enrolled"], "roles": ["Student"], "purpose": "Confirm eligibility to borrow books", "color": "mint"},
+    {"id": "fees", "name": "Fee Portal", "kind": "Payments", "description": "Match your account using a service-specific campus reference.", "attributes": ["service_subject_id"], "roles": ["Student"], "purpose": "Find your fee account without sharing your name or enrollment number", "color": "violet"},
+    {"id": "attendance", "name": "Attendance", "kind": "Classes", "description": "Confirm your campus role and class membership.", "attributes": ["role", "class_membership"], "roles": ["Student", "Faculty"], "purpose": "Check class attendance permissions", "color": "amber"},
+    {"id": "lms", "name": "Learning (LMS)", "kind": "Courses", "description": "Share only your course list with the learning platform.", "attributes": ["course_membership"], "roles": ["Student", "Faculty"], "purpose": "Open your campus learning spaces", "color": "blue"},
 ]
-ATTRIBUTES = {"is_enrolled": "Currently enrolled", "full_name": "Full name", "roll_number": "Enrollment number", "program": "Program of study", "hostel_resident": "Hostel resident status"}
+ATTRIBUTES = {"is_enrolled": "Currently enrolled", "service_subject_id": "Private service reference", "role": "Campus role", "class_membership": "Member of an eligible class", "course_membership": "Course list"}
 
 
 def connect():
@@ -129,8 +138,31 @@ def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def rate_limit_key(identifier: str) -> str:
+    return hashlib.sha256(identifier.strip().lower().encode()).hexdigest()
+
+
+def rate_limited(con, key: str, timestamp: int) -> bool:
+    row = con.execute("SELECT locked_until FROM login_rate_limits WHERE identifier_hash=?", (key,)).fetchone()
+    return bool(row and row["locked_until"] > timestamp)
+
+
+def record_failed_attempt(con, key: str, timestamp: int):
+    con.execute("""INSERT INTO login_rate_limits(identifier_hash,failures,window_started_at,locked_until,updated_at)
+        VALUES(?,1,?,0,?)
+        ON CONFLICT(identifier_hash) DO UPDATE SET
+          failures=CASE WHEN login_rate_limits.window_started_at >= excluded.updated_at - 60 THEN login_rate_limits.failures + 1 ELSE 1 END,
+          window_started_at=CASE WHEN login_rate_limits.window_started_at >= excluded.updated_at - 60 THEN login_rate_limits.window_started_at ELSE excluded.updated_at END,
+          locked_until=CASE WHEN (CASE WHEN login_rate_limits.window_started_at >= excluded.updated_at - 60 THEN login_rate_limits.failures + 1 ELSE 1 END) >= 5 THEN excluded.updated_at + 60 ELSE 0 END,
+          updated_at=excluded.updated_at""", (key, timestamp, timestamp))
+
+
 def session_cookie(token: str, max_age: int) -> str:
     return f"tp_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}{COOKIE_SECURE}"
+
+
+def new_session_token() -> str:
+    return f"{int(time.time())}.{secrets.token_urlsafe(32)}"
 
 
 def request_path(request_target: str) -> str:
@@ -142,14 +174,20 @@ def request_path(request_target: str) -> str:
     return parsed.path
 
 
-def password_hash(password: str, salt: bytes | None = None) -> str:
-    salt = salt or secrets.token_bytes(16)
+def password_hash(password: str) -> str:
+    if ARGON2:
+        return ARGON2.hash(password)
+    salt = secrets.token_bytes(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 310_000)
-    return f"{base64.urlsafe_b64encode(salt).decode()}${base64.urlsafe_b64encode(digest).decode()}"
+    return f"${base64.urlsafe_b64encode(salt).decode()}${base64.urlsafe_b64encode(digest).decode()}"
 
 
 def password_ok(password: str, saved: str) -> bool:
     try:
+        if saved.startswith("$argon2id$"):
+            if not ARGON2:
+                return False
+            return ARGON2.verify(saved, password)
         salt64, digest64 = saved.split("$", 1)
         salt = base64.urlsafe_b64decode(salt64)
         expected = base64.urlsafe_b64decode(digest64)
@@ -194,6 +232,8 @@ def init_db():
             CREATE TABLE IF NOT EXISTS consents(user_id TEXT NOT NULL REFERENCES users(id), service_id TEXT NOT NULL, granted INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(user_id,service_id));
             CREATE TABLE IF NOT EXISTS passes(jti_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), expires_at INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT NOT NULL, service TEXT NOT NULL, details TEXT NOT NULL, previous_hash TEXT NOT NULL, entry_hash TEXT NOT NULL);
+            CREATE TRIGGER IF NOT EXISTS audit_no_update BEFORE UPDATE ON audit BEGIN SELECT RAISE(ABORT, 'audit records are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON audit BEGIN SELECT RAISE(ABORT, 'audit records are append-only'); END;
             CREATE TABLE IF NOT EXISTS recovery(id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), code_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, cooling_until INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS backup_codes(user_id TEXT NOT NULL REFERENCES users(id), code_hash TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(user_id,code_hash));
             CREATE TABLE IF NOT EXISTS login_rate_limits(identifier_hash TEXT PRIMARY KEY, failures INTEGER NOT NULL DEFAULT 0, window_started_at INTEGER NOT NULL, locked_until INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL);
@@ -243,7 +283,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
         self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
-        for k, v in (headers or {}).items(): self.send_header(k, v)
+        response_headers = dict(headers or {})
+        if getattr(self, "rotated_session_cookie", None):
+            response_headers.setdefault("Set-Cookie", self.rotated_session_cookie)
+        for k, v in response_headers.items(): self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
@@ -259,7 +302,28 @@ class Handler(BaseHTTPRequestHandler):
     def authenticated(self, con):
         token = self.cookie_token()
         if not token: return None
-        row = con.execute("SELECT s.id AS session_id,s.user_id,u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.revoked=0 AND s.expires_at> ? AND u.active=1", (hashlib.sha256(token.encode()).hexdigest(), int(time.time()))).fetchone()
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        row = con.execute("SELECT s.id AS session_id,s.user_id,s.expires_at,u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.revoked=0 AND s.expires_at> ? AND u.active=1", (token_hash, int(time.time()))).fetchone()
+        if row:
+            try:
+                last_seen = datetime.fromisoformat(row["last_seen"]).timestamp()
+            except (TypeError, ValueError):
+                last_seen = 0
+            timestamp = int(time.time())
+            if timestamp - last_seen > IDLE_TIMEOUT_SECONDS:
+                con.execute("UPDATE sessions SET revoked=1 WHERE id=?", (row["session_id"],))
+                add_audit(con, row["name"], "session.idle_timeout", row["session_id"])
+                return None
+            con.execute("UPDATE sessions SET last_seen=? WHERE id=?", (now(), row["session_id"]))
+            try:
+                token_created = int(token.split(".", 1)[0])
+            except (TypeError, ValueError):
+                token_created = 0
+            if timestamp - token_created >= 5 * 60:
+                next_token = new_session_token()
+                rotated = con.execute("UPDATE sessions SET token_hash=? WHERE id=? AND token_hash=? AND revoked=0", (hashlib.sha256(next_token.encode()).hexdigest(), row["session_id"], token_hash))
+                if rotated.rowcount:
+                    self.rotated_session_cookie = session_cookie(next_token, max(0, int(row["expires_at"]) - timestamp))
         return row
 
     def require_user(self, con):
@@ -308,25 +372,21 @@ class Handler(BaseHTTPRequestHandler):
         with connect() as con:
             if path == "/api/login":
                 email = str(body.get("email", "")).strip().lower()
-                attempt_key = hashlib.sha256(email.encode()).hexdigest()
+                attempt_key = rate_limit_key(email)
                 timestamp = int(time.time())
-                rate = con.execute("SELECT locked_until FROM login_rate_limits WHERE identifier_hash=?", (attempt_key,)).fetchone()
-                if rate and rate["locked_until"] > timestamp:
+                if rate_limited(con, attempt_key, timestamp):
                     return self.send_json(429, {"error": "Too many sign-in attempts. Wait a minute, then try again."})
                 row = con.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
                 ok = row and row["active"] and password_ok(str(body.get("password", "")), row["password_hash"]) and hmac.compare_digest(str(body.get("otp", "")), totp(row["otp_secret"]))
                 if not ok:
-                    con.execute("""INSERT INTO login_rate_limits(identifier_hash,failures,window_started_at,locked_until,updated_at)
-                        VALUES(?,1,?,0,?)
-                        ON CONFLICT(identifier_hash) DO UPDATE SET
-                          failures=CASE WHEN login_rate_limits.window_started_at >= excluded.updated_at - 60 THEN login_rate_limits.failures + 1 ELSE 1 END,
-                          window_started_at=CASE WHEN login_rate_limits.window_started_at >= excluded.updated_at - 60 THEN login_rate_limits.window_started_at ELSE excluded.updated_at END,
-                          locked_until=CASE WHEN (CASE WHEN login_rate_limits.window_started_at >= excluded.updated_at - 60 THEN login_rate_limits.failures + 1 ELSE 1 END) >= 5 THEN excluded.updated_at + 60 ELSE 0 END,
-                          updated_at=excluded.updated_at""", (attempt_key, timestamp, timestamp))
+                    record_failed_attempt(con, attempt_key, timestamp)
                     add_audit(con, row["name"] if row else email, "auth.failed", email)
                     return self.send_json(401, {"error": "Those details did not match. Check your password and current authenticator code."})
                 con.execute("DELETE FROM login_rate_limits WHERE identifier_hash=?", (attempt_key,))
-                token = secrets.token_urlsafe(32); session_id = secrets.token_hex(12); ts = now(); exp = int(time.time()) + 12 * 3600
+                if ARGON2 and not row["password_hash"].startswith("$argon2id$"):
+                    con.execute("UPDATE users SET password_hash=? WHERE id=?", (password_hash(str(body.get("password", ""))), row["id"]))
+                    add_audit(con, row["name"], "auth.password_hash_upgraded", row["id"], details="Argon2id")
+                token = new_session_token(); session_id = secrets.token_hex(12); ts = now(); exp = int(time.time()) + 12 * 3600
                 con.execute("INSERT INTO sessions VALUES(?,?,?,?,?,?,?,0)", (session_id, row["id"], hashlib.sha256(token.encode()).hexdigest(), self.headers.get("User-Agent", "Web browser")[:140], ts, ts, exp))
                 add_audit(con, row["name"], "auth.success", row["id"])
                 return self.send_json(200, self.dashboard(con, row), {"Set-Cookie": session_cookie(token, 43200)})
@@ -336,23 +396,31 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception: return self.send_json(400, {"valid": False, "error": "This pass is expired or invalid."})
                 if not service: return self.send_json(400, {"valid": False, "error": "Unknown campus service."})
                 user = con.execute("SELECT * FROM users WHERE id=? AND active=1", (uid,)).fetchone()
+                if not user or user["role"] not in service["roles"]: return self.send_json(403, {"valid": False, "error": "Your campus role is not permitted to use this service."})
                 pass_row = con.execute("SELECT * FROM passes WHERE jti_hash=? AND user_id=? AND expires_at>? AND used=0", (hashlib.sha256(jti.encode()).hexdigest(), uid, int(time.time()))).fetchone()
                 if not user or not pass_row: return self.send_json(409, {"valid": False, "error": "This pass was already used or revoked."})
                 consent = con.execute("SELECT granted FROM consents WHERE user_id=? AND service_id=?", (uid, service_id)).fetchone()
                 if not consent or not consent[0]: return self.send_json(403, {"valid": False, "error": "The student has not approved this service."})
                 con.execute("UPDATE passes SET used=1 WHERE jti_hash=?", (hashlib.sha256(jti.encode()).hexdigest(),))
-                shared = {"is_enrolled": True, "full_name": user["name"], "roll_number": user["roll_number"], "program": user["program"], "hostel_resident": bool(user["hostel"])}
+                subject = hmac.new(SIGNING_KEY, f"subject:{service_id}:{user['id']}".encode(), hashlib.sha256).hexdigest()[:24]
+                shared = {"is_enrolled": True, "service_subject_id": subject, "role": user["role"], "class_membership": user["role"] in ("Student", "Faculty"), "course_membership": ["CS301", "CS302"] if user["role"] == "Student" else ["CS301", "CS401"]}
                 data = {key: shared[key] for key in service["attributes"]}
                 add_audit(con, user["name"], "identity.verified", user["id"], service["name"], ",".join(service["attributes"]))
                 return self.send_json(200, {"valid": True, "service": service["name"], "attributes": data, "expires_at": exp})
             if path == "/api/recovery/start":
                 email = str(body.get("email", "")).strip().lower()
+                attempt_key = rate_limit_key("recovery:" + email)
+                timestamp = int(time.time())
+                if rate_limited(con, attempt_key, timestamp):
+                    return self.send_json(429, {"error": "Too many recovery attempts. Wait a minute, then try again."})
                 backup = str(body.get("backup_code", "")).upper()
                 row = con.execute("SELECT * FROM users WHERE email=? AND active=1", (email,)).fetchone()
                 backup_hash = hashlib.sha256(backup.encode()).hexdigest()
                 saved = con.execute("SELECT 1 FROM backup_codes WHERE user_id=? AND code_hash=? AND used=0", (row["id"], backup_hash)).fetchone() if row else None
                 if not row or not password_ok(str(body.get("password", "")), row["password_hash"]) or not saved:
+                    record_failed_attempt(con, attempt_key, timestamp)
                     return self.send_json(401, {"error": "The account details or backup code could not be verified."})
+                con.execute("DELETE FROM login_rate_limits WHERE identifier_hash=?", (attempt_key,))
                 con.execute("UPDATE backup_codes SET used=1 WHERE user_id=? AND code_hash=?", (row["id"], backup_hash))
                 rid = secrets.token_hex(12); recovery_code = f"{secrets.randbelow(1_000_000):06d}"; exp = int(time.time()) + 900; cool = int(time.time()) + 15
                 con.execute("INSERT INTO recovery VALUES(?,?,?,?,?,0)", (rid, row["id"], hashlib.sha256(recovery_code.encode()).hexdigest(), exp, cool))
@@ -360,9 +428,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, {"recovery_id": rid, "email_code": recovery_code, "cooling_seconds": 15, "message": "For this local demo, the email code is displayed here. In a real deployment it would be sent to your verified campus inbox."})
             if path == "/api/recovery/complete":
                 rid = str(body.get("recovery_id", "")); code = str(body.get("email_code", ""))
+                attempt_key = rate_limit_key("recovery-complete:" + rid)
+                timestamp = int(time.time())
+                if rate_limited(con, attempt_key, timestamp):
+                    return self.send_json(429, {"error": "Too many recovery code attempts. Wait a minute, then try again."})
                 row = con.execute("SELECT r.*,u.name FROM recovery r JOIN users u ON u.id=r.user_id WHERE r.id=? AND r.used=0", (rid,)).fetchone()
                 if not row or row["expires_at"] < int(time.time()) or row["cooling_until"] > int(time.time()) or not hmac.compare_digest(row["code_hash"], hashlib.sha256(code.encode()).hexdigest()):
+                    record_failed_attempt(con, attempt_key, timestamp)
                     return self.send_json(400, {"error": "Recovery code is invalid or the cooling-off period is still active."})
+                con.execute("DELETE FROM login_rate_limits WHERE identifier_hash=?", (attempt_key,))
                 con.execute("UPDATE recovery SET used=1 WHERE id=?", (rid,)); con.execute("UPDATE sessions SET revoked=1 WHERE user_id=?", (row["user_id"],)); add_audit(con, row["name"], "recovery.completed", row["user_id"], details="all sessions revoked")
                 return self.send_json(200, {"ok": True, "message": "Recovery complete. All signed-in devices have been signed out. Sign in again and set up your authenticator."}, {"Set-Cookie": session_cookie("", 0)})
             user = self.require_user(con)
