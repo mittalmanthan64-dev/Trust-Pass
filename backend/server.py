@@ -1,4 +1,4 @@
-"""OneCampus TrustPass demo API. Uses only the Python standard library."""
+"""OneCampus TrustPass demo API; uses the standard library locally and psycopg for Supabase."""
 from __future__ import annotations
 
 import base64
@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sqlite3
 import struct
@@ -14,14 +15,44 @@ from datetime import datetime, timezone
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def load_local_env():
+    """Read a simple local .env without overwriting environment settings."""
+    if os.environ.get("VERCEL"):
+        return
+    env_path = ROOT / ".env"
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key:
+            os.environ.setdefault(key, value)
+
+
+load_local_env()
 DB_PATH = Path(os.environ.get("TRUSTPASS_DB", Path(__file__).parent / "data" / "trustpass.sqlite3"))
 PORT = int(os.environ.get("PORT", "8000"))
+HOST = os.environ.get("TRUSTPASS_HOST", "127.0.0.1")
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 SIGNING_KEY = os.environ.get("TRUSTPASS_SIGNING_KEY", "local-demo-signing-key-change-before-deploy").encode()
-DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-LOGIN_FAILURES: dict[str, tuple[int, int]] = {}
+if os.environ.get("VERCEL") and not DATABASE_URL:
+    raise RuntimeError("Set DATABASE_URL in the Vercel project environment before deploying.")
+if os.environ.get("VERCEL") and not os.environ.get("TRUSTPASS_SIGNING_KEY"):
+    raise RuntimeError("Set TRUSTPASS_SIGNING_KEY in the Vercel project environment before deploying.")
+
+COOKIE_SECURE = "; Secure" if os.environ.get("VERCEL") else ""
 
 SERVICES = [
     {"id": "library", "name": "Library", "kind": "Books & study", "description": "Confirm active student status for borrowing privileges.", "attributes": ["is_enrolled"], "purpose": "Confirm eligibility to borrow books", "color": "mint"},
@@ -33,14 +64,82 @@ ATTRIBUTES = {"is_enrolled": "Currently enrolled", "full_name": "Full name", "ro
 
 
 def connect():
+    if DATABASE_URL:
+        try:
+            import psycopg
+        except ImportError as exc:
+            raise RuntimeError("Install the backend dependencies from requirements.txt to use Supabase.") from exc
+        con = psycopg.connect(
+            DATABASE_URL,
+            row_factory=compat_row_factory,
+            sslmode="require",
+            connect_timeout=10,
+            prepare_threshold=None,
+        )
+        con.execute("SET search_path TO private, public")
+        return PostgresCompat(con)
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON")
     return con
 
 
+class CompatRow(dict):
+    """Mapping row with SQLite-style numeric indexing for the existing API code."""
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return tuple(self.values())[key]
+        return super().__getitem__(key)
+
+
+def compat_row_factory(cursor):
+    columns = [column.name for column in cursor.description]
+    return lambda values: CompatRow(zip(columns, values))
+
+
+class PostgresCompat:
+    """Small placeholder/row adapter so the same handlers work with SQLite or Postgres."""
+    def __init__(self, connection):
+        self.connection = connection
+
+    def execute(self, query, params=()):
+        ignore_conflicts = bool(re.match(r"\s*INSERT\s+OR\s+IGNORE\s+INTO\b", query, re.I))
+        query = re.sub(r"\bINSERT\s+OR\s+IGNORE\s+INTO\b", "INSERT INTO", query, flags=re.I)
+        query = query.replace("?", "%s")
+        if ignore_conflicts:
+            query = query.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+        return self.connection.execute(query, params)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        try:
+            if exc_type:
+                self.connection.rollback()
+            else:
+                self.connection.commit()
+        finally:
+            self.connection.close()
+        return False
+
+
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def session_cookie(token: str, max_age: int) -> str:
+    return f"tp_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}{COOKIE_SECURE}"
+
+
+def request_path(request_target: str) -> str:
+    parsed = urlparse(request_target)
+    if parsed.path == "/api/index.py":
+        forwarded = parse_qs(parsed.query).get("__path", [])
+        if forwarded:
+            return "/api/" + forwarded[0].lstrip("/")
+    return parsed.path
 
 
 def password_hash(password: str, salt: bytes | None = None) -> str:
@@ -70,6 +169,9 @@ def totp(secret: str, at: int | None = None) -> str:
 
 
 def add_audit(con, actor, action, target, service="TrustPass", details=""):
+    if isinstance(con, PostgresCompat):
+        # Serialize audit writes so concurrent serverless requests cannot fork the hash chain.
+        con.execute("SELECT pg_advisory_xact_lock(741852963)")
     previous = con.execute("SELECT entry_hash FROM audit ORDER BY id DESC LIMIT 1").fetchone()
     prev_hash = previous[0] if previous else "0" * 64
     created = now()
@@ -81,19 +183,26 @@ def add_audit(con, actor, action, target, service="TrustPass", details=""):
 
 def init_db():
     with connect() as con:
-        con.executescript("""
-        CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL, name TEXT NOT NULL, role TEXT NOT NULL, password_hash TEXT NOT NULL, otp_secret TEXT NOT NULL, roll_number TEXT NOT NULL, program TEXT NOT NULL, year INTEGER NOT NULL, hostel INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), token_hash TEXT NOT NULL UNIQUE, device TEXT NOT NULL, created_at TEXT NOT NULL, last_seen TEXT NOT NULL, expires_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS consents(user_id TEXT NOT NULL REFERENCES users(id), service_id TEXT NOT NULL, granted INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(user_id,service_id));
-        CREATE TABLE IF NOT EXISTS passes(jti_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), expires_at INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT NOT NULL, service TEXT NOT NULL, details TEXT NOT NULL, previous_hash TEXT NOT NULL, entry_hash TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS recovery(id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), code_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, cooling_until INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS backup_codes(user_id TEXT NOT NULL REFERENCES users(id), code_hash TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(user_id,code_hash));
-        """)
+        if DATABASE_URL:
+            ready = con.execute("SELECT to_regclass('private.users') AS users_table").fetchone()
+            if not ready or not ready["users_table"]:
+                raise RuntimeError("Supabase tables are missing. Apply supabase/app_store.sql to this project before starting TrustPass.")
+        else:
+            con.executescript("""
+            CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL, name TEXT NOT NULL, role TEXT NOT NULL, password_hash TEXT NOT NULL, otp_secret TEXT NOT NULL, roll_number TEXT NOT NULL, program TEXT NOT NULL, year INTEGER NOT NULL, hostel INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), token_hash TEXT NOT NULL UNIQUE, device TEXT NOT NULL, created_at TEXT NOT NULL, last_seen TEXT NOT NULL, expires_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS consents(user_id TEXT NOT NULL REFERENCES users(id), service_id TEXT NOT NULL, granted INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(user_id,service_id));
+            CREATE TABLE IF NOT EXISTS passes(jti_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), expires_at INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT NOT NULL, service TEXT NOT NULL, details TEXT NOT NULL, previous_hash TEXT NOT NULL, entry_hash TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS recovery(id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), code_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, cooling_until INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS backup_codes(user_id TEXT NOT NULL REFERENCES users(id), code_hash TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(user_id,code_hash));
+            CREATE TABLE IF NOT EXISTS login_rate_limits(identifier_hash TEXT PRIMARY KEY, failures INTEGER NOT NULL DEFAULT 0, window_started_at INTEGER NOT NULL, locked_until INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL);
+            """)
         if not con.execute("SELECT 1 FROM users LIMIT 1").fetchone():
-            con.execute("INSERT INTO users VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", ("usr_student_01", "aarav.sharma@northfield.edu", "Aarav Sharma", "Student", password_hash("CampusDemo!26"), "JBSWY3DPEHPK3PXP", "EN2023CS001", "B.Tech Computer Science", 3, 1, 1, now()))
+            seed_suffix = " ON CONFLICT DO NOTHING" if DATABASE_URL else ""
+            con.execute("INSERT INTO users VALUES(?,?,?,?,?,?,?,?,?,?,?,?)" + seed_suffix, ("usr_student_01", "aarav.sharma@northfield.edu", "Aarav Sharma", "Student", password_hash("CampusDemo!26"), "JBSWY3DPEHPK3PXP", "EN2023CS001", "B.Tech Computer Science", 3, 1, 1, now()))
             # A separate staff identity demonstrates role-aware administrative access.
-            con.execute("INSERT INTO users VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", ("usr_admin_01", "admin@northfield.edu", "Mira Patel", "Security Admin", password_hash("CampusAdmin!26"), "KRSXG5DSNFXGOIDB", "STAFF-0042", "Campus Security", 0, 0, 1, now()))
+            con.execute("INSERT INTO users VALUES(?,?,?,?,?,?,?,?,?,?,?,?)" + seed_suffix, ("usr_admin_01", "admin@northfield.edu", "Mira Patel", "Security Admin", password_hash("CampusAdmin!26"), "KRSXG5DSNFXGOIDB", "STAFF-0042", "Campus Security", 0, 0, 1, now()))
             add_audit(con, "system", "workspace.created", "TrustPass", details="demo seed")
         for service in SERVICES:
             con.execute("INSERT OR IGNORE INTO consents(user_id,service_id,granted,updated_at) VALUES(?,?,?,?)", ("usr_student_01", service["id"], 1 if service["id"] == "library" else 0, now()))
@@ -159,7 +268,7 @@ class Handler(BaseHTTPRequestHandler):
         return user
 
     def do_GET(self):
-        path = urlparse(self.path).path
+        path = request_path(self.path)
         if path.startswith("/api/"):
             with connect() as con:
                 if path == "/api/bootstrap":
@@ -194,27 +303,33 @@ class Handler(BaseHTTPRequestHandler):
         except (OSError, ValueError): self.send_json(404, {"error": "Not found."})
 
     def do_POST(self):
-        path = urlparse(self.path).path
+        path = request_path(self.path)
         body = self.read_body()
         with connect() as con:
             if path == "/api/login":
                 email = str(body.get("email", "")).strip().lower()
-                failures, blocked_until = LOGIN_FAILURES.get(email, (0, 0))
-                if blocked_until > int(time.time()):
+                attempt_key = hashlib.sha256(email.encode()).hexdigest()
+                timestamp = int(time.time())
+                rate = con.execute("SELECT locked_until FROM login_rate_limits WHERE identifier_hash=?", (attempt_key,)).fetchone()
+                if rate and rate["locked_until"] > timestamp:
                     return self.send_json(429, {"error": "Too many sign-in attempts. Wait a minute, then try again."})
                 row = con.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
                 ok = row and row["active"] and password_ok(str(body.get("password", "")), row["password_hash"]) and hmac.compare_digest(str(body.get("otp", "")), totp(row["otp_secret"]))
                 if not ok:
-                    failures += 1
-                    blocked_until = int(time.time()) + 60 if failures >= 5 else 0
-                    LOGIN_FAILURES[email] = (0 if blocked_until else failures, blocked_until)
+                    con.execute("""INSERT INTO login_rate_limits(identifier_hash,failures,window_started_at,locked_until,updated_at)
+                        VALUES(?,1,?,0,?)
+                        ON CONFLICT(identifier_hash) DO UPDATE SET
+                          failures=CASE WHEN login_rate_limits.window_started_at >= excluded.updated_at - 60 THEN login_rate_limits.failures + 1 ELSE 1 END,
+                          window_started_at=CASE WHEN login_rate_limits.window_started_at >= excluded.updated_at - 60 THEN login_rate_limits.window_started_at ELSE excluded.updated_at END,
+                          locked_until=CASE WHEN (CASE WHEN login_rate_limits.window_started_at >= excluded.updated_at - 60 THEN login_rate_limits.failures + 1 ELSE 1 END) >= 5 THEN excluded.updated_at + 60 ELSE 0 END,
+                          updated_at=excluded.updated_at""", (attempt_key, timestamp, timestamp))
                     add_audit(con, row["name"] if row else email, "auth.failed", email)
                     return self.send_json(401, {"error": "Those details did not match. Check your password and current authenticator code."})
-                LOGIN_FAILURES.pop(email, None)
+                con.execute("DELETE FROM login_rate_limits WHERE identifier_hash=?", (attempt_key,))
                 token = secrets.token_urlsafe(32); session_id = secrets.token_hex(12); ts = now(); exp = int(time.time()) + 12 * 3600
                 con.execute("INSERT INTO sessions VALUES(?,?,?,?,?,?,?,0)", (session_id, row["id"], hashlib.sha256(token.encode()).hexdigest(), self.headers.get("User-Agent", "Web browser")[:140], ts, ts, exp))
                 add_audit(con, row["name"], "auth.success", row["id"])
-                return self.send_json(200, self.dashboard(con, row), {"Set-Cookie": f"tp_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200"})
+                return self.send_json(200, self.dashboard(con, row), {"Set-Cookie": session_cookie(token, 43200)})
             if path == "/api/verify":
                 service_id = str(body.get("service_id", "")); service = next((s for s in SERVICES if s["id"] == service_id), None)
                 try: uid, jti, exp = decode_pass(str(body.get("token", "")))
@@ -249,12 +364,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not row or row["expires_at"] < int(time.time()) or row["cooling_until"] > int(time.time()) or not hmac.compare_digest(row["code_hash"], hashlib.sha256(code.encode()).hexdigest()):
                     return self.send_json(400, {"error": "Recovery code is invalid or the cooling-off period is still active."})
                 con.execute("UPDATE recovery SET used=1 WHERE id=?", (rid,)); con.execute("UPDATE sessions SET revoked=1 WHERE user_id=?", (row["user_id"],)); add_audit(con, row["name"], "recovery.completed", row["user_id"], details="all sessions revoked")
-                return self.send_json(200, {"ok": True, "message": "Recovery complete. All signed-in devices have been signed out. Sign in again and set up your authenticator."}, {"Set-Cookie": "tp_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"})
+                return self.send_json(200, {"ok": True, "message": "Recovery complete. All signed-in devices have been signed out. Sign in again and set up your authenticator."}, {"Set-Cookie": session_cookie("", 0)})
             user = self.require_user(con)
             if not user: return
             if path == "/api/logout":
                 con.execute("UPDATE sessions SET revoked=1 WHERE id=?", (user["session_id"],)); add_audit(con, user["name"], "session.logout", user["session_id"])
-                return self.send_json(200, {"ok": True}, {"Set-Cookie": "tp_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"})
+                return self.send_json(200, {"ok": True}, {"Set-Cookie": session_cookie("", 0)})
             if path == "/api/pass":
                 jti = secrets.token_urlsafe(20); exp = int(time.time()) + 30
                 con.execute("INSERT INTO passes(jti_hash,user_id,expires_at) VALUES(?,?,?)", (hashlib.sha256(jti.encode()).hexdigest(), user["id"], exp))
@@ -262,7 +377,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(404, {"error": "Not found."})
 
     def do_PUT(self):
-        path = urlparse(self.path).path; body = self.read_body()
+        path = request_path(self.path); body = self.read_body()
         with connect() as con:
             user = self.require_user(con)
             if not user: return
@@ -318,5 +433,5 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     init_db()
-    print(f"TrustPass API and frontend running at http://127.0.0.1:{PORT}")
-    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    print(f"TrustPass API and frontend listening on {HOST}:{PORT}")
+    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()

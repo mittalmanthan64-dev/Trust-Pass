@@ -1,4 +1,11 @@
 backend/data/
 __pycache__/
+**/__pycache__/
 *.py[cod]
 .env
+.env.*
+!.env.example
+.vercel/
+node_modules/
+.DS_Store
+Thumbs.db
